@@ -1,0 +1,32 @@
+# Rust / embedded build artifacts
+/target/
+
+# Binary outputs
+*.hex
+*.bin
+*.elf
+*.dfu
+
+# Common editor/IDE files
+.vscode/
+.idea/
+*.swo
+*.log
+
+# Other
+/build/
+**/dist/
+
+# Generated build output from build.rs
+**/out/*.rs
+
+# VS Code workspace config
+.vscode/
+
+# Cargo incremental and lock files (if accidentally created)
+**/.fingerprint/
+**/incremental/
+
+# Keep local test artifacts out
+*.pytest_cache/
+
