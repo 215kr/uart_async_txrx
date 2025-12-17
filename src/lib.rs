@@ -105,11 +105,13 @@ impl UartUninitialized {
         rx_pin: Peri<'static, peripherals::P0_08>,
         tx_pin: Peri<'static, peripherals::P0_06>,
         prio: interrupt::Priority,
+        baudrate: uarte::Baudrate,
         spawner: Spawner,
     ) -> UartInitialized {
         interrupt::UARTE0.set_priority(prio);
         rprintln!("[UARTE] NVIC priority set for UARTE0 (from hw_init)");
-        let cfg = uarte::Config::default();
+        let mut cfg = uarte::Config::default();
+        cfg.baudrate = baudrate;
         let uarte = uarte::Uarte::new(uarte_peri, rx_pin, tx_pin, Irqs, cfg);
         let (tx, rx) = uarte.split();
 
