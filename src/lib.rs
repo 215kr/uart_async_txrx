@@ -2,26 +2,24 @@
 
 extern crate core;
 
-use core::marker::Sync;
-use core::default::Default;
 use embassy_executor::Spawner;
-use embassy_nrf::uarte;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
+use embassy_nrf::uarte;
 
 // Provide the interrupt binding type for UARTE0 inside the crate so
 // application `main` does not need to define `bind_interrupts!`.
 bind_interrupts!(struct Irqs {
     UARTE0 => uarte::InterruptHandler<peripherals::UARTE0>;
 });
-use heapless::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::ffi::CStr;
-use rtt_target::rprintln;
-use heapless::spsc::Queue;
-use core::mem::MaybeUninit;
 use core::cell::UnsafeCell;
-use embassy_time::{Duration, Timer, with_timeout};
+use core::ffi::CStr;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use embassy_time::{with_timeout, Duration, Timer};
+use heapless::spsc::Queue;
+use heapless::Vec;
+use rtt_target::rprintln;
 
 // `build.rs` will generate `queue_cap.rs` into OUT_DIR which defines
 // `pub const QUEUE_CAP: usize = ...;`. It picks value from the
@@ -29,20 +27,51 @@ use embassy_time::{Duration, Timer, with_timeout};
 include!(concat!(env!("OUT_DIR"), "/queue_cap.rs"));
 // no atomic globals needed when Uart is stored as a `'static` in `main`
 use embassy_nrf::interrupt;
-use embassy_nrf::Peri;
 use embassy_nrf::interrupt::InterruptExt;
+use embassy_nrf::Peri;
 
+/// UART driver for nRF52 using Embassy async runtime.
+///
+/// Provides non-blocking UART communication using lock-free SPSC queues.
+/// Background tasks handle the actual hardware TX/RX operations.
+///
+/// # Usage
+///
+/// ```no_run
+/// let mut uart = Uart::new();
+/// uart.hw_init(uarte0, rx_pin, tx_pin, Priority::P3, spawner);
+///
+/// // Write data
+/// uart.println("Hello, world!");
+/// uart.write(b"raw bytes");
+///
+/// // Read data
+/// if let Some(byte) = uart.read() {
+///     rprintln!("Received: {}", byte);
+/// }
+/// ```
+///
+/// # Safety
+///
+/// `hw_init()` must be called exactly once before using any other methods.
+/// The internal queue endpoints use `UnsafeCell` for interior mutability,
+/// which is safe under the single-initialization discipline enforced by the
+/// API design.
 pub struct Uart {
-    // No queue endpoints stored here; hw_init will split queues and
-    // spawn tasks that take ownership of the endpoints. Uart itself
-    // only carries hardware handles if needed (none required currently).
+    // Queue endpoints are stored in UnsafeCell to allow interior mutability.
+    // SAFETY: hw_init() initializes these exactly once before any other method
+    // is called. After initialization, access is synchronized by the task model:
+    // - tx_prod: only accessed from user code (single-threaded)
+    // - rx_cons: only accessed from user code (single-threaded)
     tx_prod: UnsafeCell<MaybeUninit<heapless::spsc::Producer<'static, u8, QUEUE_CAP>>>,
     rx_cons: UnsafeCell<MaybeUninit<heapless::spsc::Consumer<'static, u8, QUEUE_CAP>>>,
 }
-// `Uart` will be stored as a `'static` reference and shared across tasks.
-// The `UnsafeCell` interior access is guarded by the single-init / usage
-// discipline enforced by `hw_init` + spawn ordering. Marking `Uart` as
-// `Sync` is unsafe but acceptable under these usage constraints.
+
+// SAFETY: Uart is designed to be shared across tasks.
+// The UnsafeCell access is guarded by:
+// 1. hw_init() is called exactly once before any other method
+// 2. After init, tx_prod/rx_cons are each accessed from only one logical context
+// 3. The SPSC queue itself provides lock-free synchronization
 unsafe impl Sync for Uart {}
 
 struct StaticUart(UnsafeCell<MaybeUninit<Uart>>);
@@ -53,6 +82,18 @@ static UART_STORAGE: StaticUart = StaticUart(UnsafeCell::new(MaybeUninit::uninit
 static RX_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TX_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Initialize the global UART instance.
+///
+/// This should be called once at startup to create the global UART instance.
+///
+/// # Safety
+///
+/// Must be called exactly once. Calling this function multiple times will
+/// result in undefined behavior.
+///
+/// # Returns
+///
+/// A static reference to the initialized UART instance.
 pub fn init_global(u: Uart) -> &'static Uart {
     unsafe {
         (*UART_STORAGE.0.get()).as_mut_ptr().write(u);
@@ -70,44 +111,58 @@ impl Uart {
     pub fn available_for_write(&self) -> usize {
         let cap = QUEUE_CAP;
         let used = TX_COUNT.load(Ordering::SeqCst);
-        if used >= cap { 0 } else { cap - used }
+        if used >= cap {
+            0
+        } else {
+            cap - used
+        }
     }
 
     /// Asynchronously wait until all enqueued TX bytes have been transmitted.
     pub async fn flush(&self) {
         loop {
-            if TX_COUNT.load(Ordering::SeqCst) == 0 { break; }
+            if TX_COUNT.load(Ordering::SeqCst) == 0 {
+                break;
+            }
             Timer::after(Duration::from_millis(5)).await;
         }
     }
 
-    /// Enqueue a Rust `&str` as a NUL-terminated C-string.
+    /// Enqueue a Rust `&str` for transmission.
+    ///
+    /// Converts the string to bytes and appends it to the TX queue.
+    /// Note: Does not add a NUL terminator.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The string to enqueue
     pub fn print(&self, s: &str) {
         // Convert &str to bytes and forward to `print_c` with a temporary NUL-terminated buffer.
         // Note: avoid heap allocation; use a small stack buffer up to capacity.
-        let mut buf: Vec<u8, 129> = Vec::new();
-        for &b in s.as_bytes() {
-            let _ = buf.push(b);
-        }
-        // append nul
-        let _ = buf.push(0);
-        // Create CStr from bytes-with-nul; safe because we ensured trailing nul
-        if let Ok(cstr) = CStr::from_bytes_with_nul(buf.as_slice()) {
-            self.print_c(cstr);
-        }
+        // Simply write the string bytes directly - more efficient than converting to CStr
+        self.write(s.as_bytes());
     }
 
     /// Enqueue a C-style NUL-terminated string into the TX queue.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The C string to enqueue (including NUL terminator)
+    ///
+    /// # Note
+    ///
+    /// Stops enqueueing if the TX queue becomes full.
     pub fn print_c(&self, s: &CStr) {
         unsafe {
-            // SAFETY: `hw_init` must have initialized `self.tx_prod` before
-            // `print_c` is ever called. Read the producer from the instance and enqueue bytes.
+            // SAFETY: hw_init() must have initialized tx_prod before any public method is called.
             let prod_ptr = (*self.tx_prod.get()).as_mut_ptr();
             let prod: &mut heapless::spsc::Producer<'static, u8, QUEUE_CAP> = &mut *prod_ptr;
             for &b in s.to_bytes_with_nul() {
                 if prod.enqueue(b).is_ok() {
                     TX_COUNT.fetch_add(1, Ordering::SeqCst);
                 } else {
+                    // Queue full - log warning
+                    rprintln!("[UART] TX queue full, dropping data");
                     break;
                 }
             }
@@ -121,6 +176,7 @@ impl Uart {
         let mut buf: Vec<u8, QUEUE_CAP> = Vec::new();
         let mut popped = 0usize;
         unsafe {
+            // SAFETY: hw_init() must have initialized rx_cons before any public method is called.
             let cons_ptr = (*self.rx_cons.get()).as_mut_ptr();
             let cons: &mut heapless::spsc::Consumer<'static, u8, QUEUE_CAP> = &mut *cons_ptr;
             while let Some(b) = cons.dequeue() {
@@ -164,7 +220,10 @@ impl Uart {
             let cons: &mut heapless::spsc::Consumer<'static, u8, QUEUE_CAP> = &mut *cons_ptr;
             while i < out.len() {
                 match cons.dequeue() {
-                    Some(b) => { out[i] = b; i += 1; }
+                    Some(b) => {
+                        out[i] = b;
+                        i += 1;
+                    }
                     None => break,
                 }
             }
@@ -182,7 +241,9 @@ impl Uart {
             let prod_ptr = (*self.tx_prod.get()).as_mut_ptr();
             let prod: &mut heapless::spsc::Producer<'static, u8, QUEUE_CAP> = &mut *prod_ptr;
             for &b in data {
-                if prod.enqueue(b).is_err() { break; }
+                if prod.enqueue(b).is_err() {
+                    break;
+                }
                 written += 1;
             }
         }
@@ -212,7 +273,9 @@ impl Uart {
             let prod_ptr = (*self.tx_prod.get()).as_mut_ptr();
             let prod: &mut heapless::spsc::Producer<'static, u8, QUEUE_CAP> = &mut *prod_ptr;
             for &b in s.to_bytes_with_nul() {
-                if prod.enqueue(b).is_err() { break; }
+                if prod.enqueue(b).is_err() {
+                    break;
+                }
                 written += 1;
             }
         }
@@ -225,7 +288,10 @@ impl Uart {
 
 impl Uart {
     pub fn new() -> Self {
-        Uart { tx_prod: UnsafeCell::new(MaybeUninit::uninit()), rx_cons: UnsafeCell::new(MaybeUninit::uninit()) }
+        Uart {
+            tx_prod: UnsafeCell::new(MaybeUninit::uninit()),
+            rx_cons: UnsafeCell::new(MaybeUninit::uninit()),
+        }
     }
 
     /// Initialize hardware and spawn internal tasks.
@@ -248,12 +314,16 @@ impl Uart {
         static mut TX_QUEUE: Queue<u8, QUEUE_CAP> = Queue::new();
         static mut RX_QUEUE: Queue<u8, QUEUE_CAP> = Queue::new();
         #[allow(static_mut_refs)]
-            let (tx_prod, tx_cons) = unsafe { TX_QUEUE.split() };
+        let (tx_prod, tx_cons) = unsafe { TX_QUEUE.split() };
         #[allow(static_mut_refs)]
         let (rx_prod, rx_cons) = unsafe { RX_QUEUE.split() };
         // store the producer and consumer into the Uart instance fields
-        unsafe { (*self.tx_prod.get()).as_mut_ptr().write(tx_prod); }
-        unsafe { (*self.rx_cons.get()).as_mut_ptr().write(rx_cons); }
+        unsafe {
+            (*self.tx_prod.get()).as_mut_ptr().write(tx_prod);
+        }
+        unsafe {
+            (*self.rx_cons.get()).as_mut_ptr().write(rx_cons);
+        }
 
         let _ = spawner.spawn(uarte_tx_task_owned(tx, tx_cons));
         rprintln!("[UARTE] TX task spawned (from hw_init)");
@@ -264,29 +334,6 @@ impl Uart {
 
 pub type Driver = Uart;
 
-impl Uart {
-    #[allow(dead_code)]
-    pub fn spawn_tasks(&mut self, tx: uarte::UarteTx<'static>, rx: uarte::UarteRx<'static>, spawner: Spawner) {
-        static mut TX_QUEUE: Queue<u8, QUEUE_CAP> = Queue::new();
-        static mut RX_QUEUE: Queue<u8, QUEUE_CAP> = Queue::new();
-        #[allow(static_mut_refs)]
-        let (tx_prod, tx_cons) = unsafe { TX_QUEUE.split() };
-        #[allow(static_mut_refs)]
-        let (rx_prod, rx_cons) = unsafe { RX_QUEUE.split() };
-        unsafe { (*self.tx_prod.get()).as_mut_ptr().write(tx_prod); }
-        unsafe { (*self.rx_cons.get()).as_mut_ptr().write(rx_cons); }
-        let _ = spawner.spawn(uarte_tx_task_owned(tx, tx_cons));
-        rprintln!("[UARTE] TX task spawned (via uart module)");
-        let _ = spawner.spawn(uarte_rx_task_owned(rx, rx_prod));
-        rprintln!("[UARTE] RX task spawned (via uart module)");
-    }
-
-    #[allow(dead_code)]
-    pub fn write_buf(&self, buf: &Vec<u8, 64>) {
-        let _ = buf;
-    }
-}
-
 impl Default for Uart {
     fn default() -> Self {
         Uart::new()
@@ -294,13 +341,20 @@ impl Default for Uart {
 }
 
 #[embassy_executor::task]
-async fn uarte_tx_task_owned(mut tx: uarte::UarteTx<'static>, mut tx_cons: heapless::spsc::Consumer<'static, u8, QUEUE_CAP>) -> ! {
+async fn uarte_tx_task_owned(
+    mut tx: uarte::UarteTx<'static>,
+    mut tx_cons: heapless::spsc::Consumer<'static, u8, QUEUE_CAP>,
+) -> ! {
     rprintln!("[UARTE-TX] started (owned task)");
     loop {
         let mut buf: Vec<u8, 64> = Vec::new();
         while let Some(b) = tx_cons.dequeue() {
-            if buf.push(b).is_err() { break; }
-            if buf.len() >= 64 { break; }
+            if buf.push(b).is_err() {
+                break;
+            }
+            if buf.len() >= 64 {
+                break;
+            }
         }
         if buf.is_empty() {
             Timer::after(Duration::from_millis(20)).await;
@@ -316,7 +370,10 @@ async fn uarte_tx_task_owned(mut tx: uarte::UarteTx<'static>, mut tx_cons: heapl
 }
 
 #[embassy_executor::task]
-async fn uarte_rx_task_owned(mut rx: uarte::UarteRx<'static>, mut rx_prod: heapless::spsc::Producer<'static, u8, QUEUE_CAP>) -> ! {
+async fn uarte_rx_task_owned(
+    mut rx: uarte::UarteRx<'static>,
+    mut rx_prod: heapless::spsc::Producer<'static, u8, QUEUE_CAP>,
+) -> ! {
     rprintln!("[UARTE-RX] started (owned task)");
     loop {
         let mut first = [0u8; 1];
@@ -335,32 +392,32 @@ async fn uarte_rx_task_owned(mut rx: uarte::UarteRx<'static>, mut rx_prod: heapl
                 // 5 consecutive 1ms periods with no input, we end collection.
                 let mut idle_misses: u8 = 0;
                 while idle_misses < 5 && len < buf.len() {
-                        let mut tmp = [0u8; 1];
-                        match with_timeout(Duration::from_millis(1), rx.read(&mut tmp)).await {
-                            Ok(read_res) => {
-                                match read_res {
-                                    Ok(()) => {
-                                        if len < buf.len() {
-                                            buf[len] = tmp[0];
-                                            len += 1;
-                                            // reset idle counter because we received data quickly
-                                            idle_misses = 0;
-                                        } else {
-                                            // buffer full
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        rprintln!("[UARTE-RX] read error during collect: {:?}", e);
+                    let mut tmp = [0u8; 1];
+                    match with_timeout(Duration::from_millis(1), rx.read(&mut tmp)).await {
+                        Ok(read_res) => {
+                            match read_res {
+                                Ok(()) => {
+                                    if len < buf.len() {
+                                        buf[len] = tmp[0];
+                                        len += 1;
+                                        // reset idle counter because we received data quickly
+                                        idle_misses = 0;
+                                    } else {
+                                        // buffer full
                                         break;
                                     }
                                 }
-                            }
-                            Err(_) => {
-                                // timeout (no data for 1ms)
-                                idle_misses += 1;
+                                Err(e) => {
+                                    rprintln!("[UARTE-RX] read error during collect: {:?}", e);
+                                    break;
+                                }
                             }
                         }
+                        Err(_) => {
+                            // timeout (no data for 1ms)
+                            idle_misses += 1;
+                        }
+                    }
                 }
 
                 // Enqueue all collected bytes at once (or until the queue is full)
