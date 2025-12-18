@@ -96,18 +96,21 @@ impl UartUninitialized {
     /// * `prio` - Interrupt priority
     /// * `spawner` - Embassy task spawner
     ///
-    /// # Returns
     ///
     /// An initialized UART ready for use.
-    pub fn hw_init(
+    pub fn hw_init<PRX, PTX>(
         self,
         uarte_peri: Peri<'static, peripherals::UARTE0>,
-        rx_pin: Peri<'static, peripherals::P0_08>,
-        tx_pin: Peri<'static, peripherals::P0_06>,
+        rx_pin: Peri<'static, PRX>,
+        tx_pin: Peri<'static, PTX>,
         prio: interrupt::Priority,
         baudrate: uarte::Baudrate,
         spawner: Spawner,
-    ) -> UartInitialized {
+    ) -> UartInitialized
+    where
+        PRX: embassy_nrf::gpio::Pin + 'static,
+        PTX: embassy_nrf::gpio::Pin + 'static,
+    {
         interrupt::UARTE0.set_priority(prio);
         rprintln!("[UARTE] NVIC priority set for UARTE0 (from hw_init)");
         let mut cfg = uarte::Config::default();
